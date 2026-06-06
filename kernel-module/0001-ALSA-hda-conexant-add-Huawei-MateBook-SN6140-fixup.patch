@@ -1,0 +1,130 @@
+From: Petr Fedchenkov <giggsoff@gmail.com>
+Date: Sat, 6 Jun 2026 00:00:00 +0300
+Subject: [PATCH] ALSA: hda/conexant: fix speaker/headphone routing on Huawei
+ MateBook 14s/16s (SN6140)
+
+On the Huawei MateBook 14s/16s (Conexant SN6140, PCI SSID 19e5:3e69) the
+internal speaker pin (0x17) ignores its own connection-select and instead
+follows the value programmed on the headphone jack pin (0x16). In addition
+the headphone jack is gated by a GPIO on the audio function group (0x01).
+The generic parser is unaware of this coupling, so it leaves speakers and
+headphones cross-wired: sound comes out of the speakers while headphones are
+plugged in, and out of the (silent) headphone jack when they are not.
+
+Add an SSID fixup that installs an automute hook re-routing the output on
+every HP jack event: select the right DAC on 0x16, toggle the speaker EAPD
+on 0x17, and drive the jack-enable GPIO on 0x01 accordingly.
+
+Signed-off-by: Petr Fedchenkov <giggsoff@gmail.com>
+---
+--- a/sound/hda/codecs/conexant.c	2026-06-06 22:46:28.668932229 +0300
++++ b/sound/hda/codecs/conexant.c	2026-06-06 22:44:54.921198315 +0300
+@@ -300,6 +300,7 @@
+ 	CXT_PINCFG_TOP_SPEAKER,
+ 	CXT_FIXUP_HP_A_U,
+ 	CXT_FIXUP_ACER_SWIFT_HP,
++	CXT_FIXUP_HUAWEI_MATEBOOK,
+ };
+ 
+ /* for hda_fixup_thinkpad_acpi() */
+@@ -845,6 +846,79 @@
+ 	{}
+ };
+
++/*
++ * Huawei MateBook 14s/16s (Conexant SN6140, PCI SSID 19e5:3e69).
++ *
++ * The internal speaker pin 0x17 ignores its own connection-select and follows
++ * the value programmed on the headphone jack pin 0x16, and the headphone jack
++ * itself is gated by a GPIO on the audio function group (0x01).  As a result
++ * the generic parser's automute leaves headphones and speakers cross-wired.
++ *
++ * Re-route explicitly using the verb sequence that has been used in userspace
++ * tooling for these machines.  The connection-select on 0x16 is reprogrammed
++ * back to the headphone DAC by the parser/userspace whenever the analog output
++ * path is set up, so it is not enough to apply this once on a jack event: the
++ * userspace daemon worked around it by rewriting the verbs every second.  We
++ * instead re-assert the routing both on every HP jack event (automute_hook)
++ * and on every playback prepare (pcm_playback_hook), which is when a silent
++ * speaker would otherwise show up.
++ */
++static void cxt_huawei_matebook_setup(struct hda_codec *codec)
++{
++	struct conexant_spec *spec = codec->spec;
++
++	/* GPIO that gates the headphone jack lives on the AFG (0x01) */
++	snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_DIRECTION, 0x02);
++	snd_hda_codec_write(codec, 0x01, 0, AC_VERB_SET_GPIO_MASK, 0x02);
++
++	if (spec->gen.hp_jack_present) {
++		/* headphones connected: route 0x16 to the HP DAC, mute speaker
++		 * EAPD and assert the GPIO that enables the jack */
++		snd_hda_codec_write(codec, 0x16, 0,
++				    AC_VERB_SET_CONNECT_SEL, 0x00);
++		snd_hda_codec_write(codec, 0x17, 0,
++				    AC_VERB_SET_EAPD_BTLENABLE, 0x00);
++		snd_hda_codec_write(codec, 0x01, 0,
++				    AC_VERB_SET_GPIO_DATA, 0x00);
++	} else {
++		/* no headphones: route to the speaker DAC, enable speaker EAPD
++		 * and deassert the jack GPIO */
++		snd_hda_codec_write(codec, 0x16, 0,
++				    AC_VERB_SET_CONNECT_SEL, 0x01);
++		snd_hda_codec_write(codec, 0x17, 0,
++				    AC_VERB_SET_EAPD_BTLENABLE, 0x02);
++		snd_hda_codec_write(codec, 0x01, 0,
++				    AC_VERB_SET_GPIO_DATA, 0x02);
++	}
++}
++
++static void cxt_huawei_matebook_automute_hook(struct hda_codec *codec)
++{
++	cxt_huawei_matebook_setup(codec);
++}
++
++static void cxt_huawei_matebook_playback_hook(struct hda_pcm_stream *hinfo,
++					      struct hda_codec *codec,
++					      struct snd_pcm_substream *substream,
++					      int action)
++{
++	/* Re-assert routing once the parser has finished setting up the
++	 * stream; this counteracts the connect-select reset on 0x16. */
++	if (action == HDA_GEN_PCM_ACT_PREPARE)
++		cxt_huawei_matebook_setup(codec);
++}
++
++static void cxt_fixup_huawei_matebook(struct hda_codec *codec,
++				      const struct hda_fixup *fix, int action)
++{
++	struct conexant_spec *spec = codec->spec;
++
++	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
++		spec->gen.automute_hook = cxt_huawei_matebook_automute_hook;
++		spec->gen.pcm_playback_hook = cxt_huawei_matebook_playback_hook;
++	}
++}
++
+ static const struct hda_fixup cxt_fixups[] = {
+ 	[CXT_PINCFG_LENOVO_X200] = {
+ 		.type = HDA_FIXUP_PINS,
+@@ -1033,6 +1107,10 @@
+ 			{ }
+ 		},
+ 	},
++	[CXT_FIXUP_HUAWEI_MATEBOOK] = {
++		.type = HDA_FIXUP_FUNC,
++		.v.func = cxt_fixup_huawei_matebook,
++	},
+ };
+ 
+ static const struct hda_quirk cxt5045_fixups[] = {
+@@ -1135,6 +1213,7 @@
+ 	SND_PCI_QUIRK(0x1c06, 0x2011, "Lemote A1004", CXT_PINCFG_LEMOTE_A1004),
+ 	SND_PCI_QUIRK(0x1c06, 0x2012, "Lemote A1205", CXT_PINCFG_LEMOTE_A1205),
+ 	SND_PCI_QUIRK(0x1d05, 0x3012, "MECHREVO Wujie 15X Pro", CXT_FIXUP_HEADSET_MIC),
++	SND_PCI_QUIRK(0x19e5, 0x3e69, "Huawei MateBook 14s/16s", CXT_FIXUP_HUAWEI_MATEBOOK),
+ 	HDA_CODEC_QUIRK(0x2782, 0x12c3, "Sirius Gen1", CXT_PINCFG_TOP_SPEAKER),
+ 	HDA_CODEC_QUIRK(0x2782, 0x12c5, "Sirius Gen2", CXT_PINCFG_TOP_SPEAKER),
+ 	{}
+-- 
+2.43.0
